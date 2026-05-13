@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+schema_output.json
+schema_output_eda.txt
