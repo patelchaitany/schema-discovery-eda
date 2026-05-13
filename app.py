@@ -95,12 +95,12 @@ def build_prompt(schema: dict, stats: dict) -> str:
     )
 
 
-def stream_llm(prompt: str, base_url: str, api_key: str, model: str):
+def stream_llm(prompt: str, sys_prompt: str, base_url: str, api_key: str, model: str):
     client = OpenAI(base_url=base_url, api_key=api_key)
     stream = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prompt},
         ],
         stream=True,
@@ -131,11 +131,20 @@ with st.sidebar:
     llm_url = st.text_input("LLM Base URL", value="http://localhost:11434/v1")
     llm_key = st.text_input("API Key", value="ollama")
     llm_model = st.text_input("Model", value="llama3.1:8b")
+    st.header("System Prompt")
+    system_prompt = st.text_area("Edit the system prompt", value=SYSTEM_PROMPT, height=300)
 
 # Connection strings
 st.header("Data Sources")
+PG_DEFAULT = "host=localhost port=5432 dbname=banking_db user=postgres password=postgres"
+MONGO_DEFAULT = "mongodb://localhost:27017"
+MONGO_DB_DEFAULT = "banking_mongo"
+
 if "connections" not in st.session_state:
-    st.session_state.connections = [{"type": "PostgreSQL", "conn": "", "db": ""}]
+    st.session_state.connections = [
+        {"type": "PostgreSQL", "conn": PG_DEFAULT, "db": ""},
+        {"type": "MongoDB", "conn": MONGO_DEFAULT, "db": MONGO_DB_DEFAULT},
+    ]
 
 def add_connection():
     st.session_state.connections.append({"type": "PostgreSQL", "conn": "", "db": ""})
@@ -232,7 +241,7 @@ if "results_schema" in st.session_state:
 
     with tab_prompt:
         st.subheader("System Prompt")
-        st.code(SYSTEM_PROMPT, language="text")
+        st.code(system_prompt, language="text")
         st.subheader("User Prompt")
         st.code(st.session_state.results_prompt, language="markdown")
 
@@ -240,7 +249,7 @@ if "results_schema" in st.session_state:
         if st.session_state.get("run_eda"):
             try:
                 st.session_state.results_eda = st.write_stream(
-                    stream_llm(st.session_state.results_prompt, llm_url, llm_key, llm_model)
+                    stream_llm(st.session_state.results_prompt, system_prompt, llm_url, llm_key, llm_model)
                 )
             except Exception as e:
                 st.error(f"LLM error: {e}")
