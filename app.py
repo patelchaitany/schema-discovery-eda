@@ -15,7 +15,7 @@ BSON_TYPE_MAP = {
 
 SYSTEM_PROMPT = """You are a senior data analyst. You will receive:
 1. A database schema (table/collection names, column names, data types)
-2. Statistical summaries (df.describe output) for each table
+2. Statistical summaries (computed via native SQL / MongoDB aggregation) for each table
 
 Perform a thorough Exploratory Data Analysis:
 - Assess data types — flag any that look miscategorized
@@ -29,7 +29,97 @@ Perform a thorough Exploratory Data Analysis:
 Be specific to the actual table names, column names, and statistics provided."""
 
 
-# --- Schema Discovery ---
+# --- Type Classification ---
+
+PG_NUMERIC_TYPES = frozenset({
+    'integer', 'bigint', 'smallint', 'numeric', 'real', 'double precision',
+})
+PG_TEXT_TYPES = frozenset({
+    'character varying', 'text', 'character',
+})
+PG_DATE_TYPES = frozenset({
+    'date', 'timestamp without time zone', 'timestamp with time zone',
+})
+PG_BOOL_TYPES = frozenset({'boolean'})
+
+
+def _to_float(val):
+    if val is None:
+        return None
+    return round(float(val), 4)
+
+
+# --- Schema Discovery (PostgreSQL — native SQL stats) ---
+
+def _pg_table_stats(cur, table_name: str, columns: dict[str, str]) -> dict:
+    """Single native SQL query per table: COUNT, AVG, STDDEV, MIN/MAX,
+    PERCENTILE_CONT (25/50/75), COUNT(DISTINCT), MODE()."""
+    numeric_cols = [c for c, t in columns.items() if t.lower() in PG_NUMERIC_TYPES]
+    text_cols = [c for c, t in columns.items() if t.lower() in PG_TEXT_TYPES]
+    date_cols = [c for c, t in columns.items() if t.lower() in PG_DATE_TYPES]
+    bool_cols = [c for c, t in columns.items() if t.lower() in PG_BOOL_TYPES]
+
+    parts = []
+    for col in columns:
+        q = f'"{col}"'
+        parts.append(f'COUNT({q}) AS "{col}|count"')
+
+        if col in numeric_cols:
+            parts.extend([
+                f'AVG({q}) AS "{col}|mean"',
+                f'STDDEV({q}) AS "{col}|std"',
+                f'MIN({q}) AS "{col}|min"',
+                f'PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {q}) AS "{col}|25%"',
+                f'PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY {q}) AS "{col}|50%"',
+                f'PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {q}) AS "{col}|75%"',
+                f'MAX({q}) AS "{col}|max"',
+            ])
+        elif col in text_cols or col in bool_cols:
+            parts.extend([
+                f'COUNT(DISTINCT {q}) AS "{col}|unique"',
+                f'MODE() WITHIN GROUP (ORDER BY {q}) AS "{col}|top"',
+            ])
+        elif col in date_cols:
+            parts.extend([
+                f'MIN({q})::text AS "{col}|min"',
+                f'MAX({q})::text AS "{col}|max"',
+            ])
+
+    query = f'SELECT {", ".join(parts)} FROM "{table_name}"'
+    cur.execute(query)
+
+    row = cur.fetchone()
+    aliases = [desc[0] for desc in cur.description]
+    raw = dict(zip(aliases, row))
+
+    stats: dict[str, dict] = {}
+    for col in columns:
+        s: dict = {"count": raw.get(f"{col}|count")}
+
+        if col in numeric_cols:
+            for key in ("mean", "std", "min", "25%", "50%", "75%", "max"):
+                s[key] = _to_float(raw.get(f"{col}|{key}"))
+        elif col in text_cols or col in bool_cols:
+            s["unique"] = raw.get(f"{col}|unique")
+            top = raw.get(f"{col}|top")
+            s["top"] = str(top) if top is not None else None
+        elif col in date_cols:
+            s["min"] = raw.get(f"{col}|min")
+            s["max"] = raw.get(f"{col}|max")
+
+        stats[col] = s
+
+    for col in text_cols + bool_cols:
+        top_val = stats[col].get("top")
+        if top_val is not None:
+            cur.execute(
+                f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col}"::text = %s',
+                (top_val,),
+            )
+            stats[col]["freq"] = cur.fetchone()[0]
+
+    return stats
+
 
 def discover_postgres(conn_string: str) -> tuple[list[dict], dict]:
     conn = psycopg2.connect(conn_string)
@@ -48,9 +138,8 @@ def discover_postgres(conn_string: str) -> tuple[list[dict], dict]:
     schema = [{name: cols} for name, cols in tables.items()]
 
     stats = {}
-    for table_name in tables:
-        df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
-        stats[table_name] = json.loads(df.describe(include="all").to_json())
+    for table_name, columns in tables.items():
+        stats[table_name] = _pg_table_stats(cur, table_name, columns)
 
     cur.close()
     conn.close()
@@ -90,7 +179,7 @@ def discover_mongodb(uri: str, db_name: str) -> tuple[list[dict], dict]:
 def build_prompt(schema: dict, stats: dict) -> str:
     return (
         f"## Schema\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-        f"## Statistical Summaries (df.describe)\n```json\n{json.dumps(stats, indent=2)}\n```\n\n"
+        f"## Statistical Summaries (Native SQL / Aggregation)\n```json\n{json.dumps(stats, indent=2)}\n```\n\n"
         "Perform a thorough EDA analysis."
     )
 
@@ -219,7 +308,7 @@ if st.button("Discover Schemas & Run EDA", type="primary"):
 # Display results if available
 if "results_schema" in st.session_state:
     tab_schema, tab_stats, tab_prompt, tab_eda = st.tabs([
-        "Schema", "Statistics (df.describe)", "LLM Prompt", "LLM EDA Analysis"
+        "Schema", "Statistics (Native SQL)", "LLM Prompt", "LLM EDA Analysis"
     ])
 
     with tab_schema:
