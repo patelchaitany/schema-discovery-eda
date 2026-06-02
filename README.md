@@ -2,6 +2,12 @@
 
 Scan PostgreSQL and MongoDB databases, discover table schemas, compute statistical summaries (`df.describe`), and get LLM-powered Exploratory Data Analysis -- all through a Streamlit UI or standalone scripts.
 
+## Demo
+
+<video src="demo/schema_discovery_eda_demo.mp4" controls width="100%">
+  <a href="demo/schema_discovery_eda_demo.mp4">Download demo video</a>
+</video>
+
 ## Setup
 
 ```bash
@@ -75,6 +81,7 @@ schema_discovery_eda/
 ├── schema_discovery.py    # Scan PostgreSQL + MongoDB schemas
 ├── llm_eda_request.py     # Send schema to LLM for EDA (CLI)
 ├── setup_test_data.py     # Seed both databases with banking test data
+├── demo/                  # README demo video (MP4)
 ├── requirements.txt       # Dependencies
 └── README.md
 ```
