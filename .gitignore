@@ -2,3 +2,4 @@
 __pycache__/
 schema_output.json
 schema_output_eda.txt
+feature_repo/data/

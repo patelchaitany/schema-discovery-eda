@@ -1,0 +1,13 @@
+[project]
+name = "schema-discovery-eda"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "feast[postgres]>=0.64.0",
+    "openai>=2.44.0",
+    "pandas>=2.3.3",
+    "psycopg2-binary>=2.9.12",
+    "pymongo>=4.17.0",
+    "streamlit>=1.58.0",
+]

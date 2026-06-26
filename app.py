@@ -1,4 +1,9 @@
 import json
+import os
+import re
+import subprocess
+import textwrap
+
 import streamlit as st
 import psycopg2
 import pandas as pd
@@ -27,6 +32,34 @@ Perform a thorough Exploratory Data Analysis:
 - Highlight any cross-table relationships visible from the stats
 
 Be specific to the actual table names, column names, and statistics provided."""
+
+FEATURE_SUGGESTION_PROMPT = """You are a senior ML engineer. You will receive a database schema, statistical summaries, and a use-case description.
+
+Suggest features that would be useful for the given use-case. For each feature, provide:
+- name: snake_case feature name
+- description: what this feature captures and why it matters for the use-case
+- entity: the primary key / entity column (e.g. "customer_id")
+- source_table: which table the feature is derived from
+- columns: list of source columns used
+- transformation: SQL-like description of how to compute it
+- dtype: the Feast value type (one of: INT64, FLOAT64, STRING, BOOL, UNIX_TIMESTAMP)
+
+Return ONLY a JSON array. No explanation, no markdown fences, no text before or after.
+Example format:
+[
+  {
+    "name": "customer_transaction_count_7d",
+    "description": "Number of transactions in the last 7 days",
+    "entity": "customer_id",
+    "source_table": "transactions",
+    "columns": ["customer_id", "timestamp"],
+    "transformation": "COUNT(*) WHERE timestamp > now() - 7 days GROUP BY customer_id",
+    "dtype": "INT64"
+  }
+]
+
+Suggest 8-15 diverse features covering different aspects of the use-case.
+Use actual table names and column names from the provided schema."""
 
 
 # --- Type Classification ---
@@ -209,6 +242,239 @@ def schema_to_tables(schema: dict) -> dict[str, pd.DataFrame]:
     return tables
 
 
+# --- Feature Engineering Helpers ---
+
+FEAST_DTYPE_MAP = {
+    "INT64": "Int64",
+    "FLOAT64": "Float64",
+    "STRING": "String",
+    "BOOL": "Bool",
+    "UNIX_TIMESTAMP": "UnixTimestamp",
+}
+
+
+def parse_feature_json(text: str) -> list[dict]:
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\[.*?])\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON array found in LLM response")
+    return json.loads(text[start : end + 1])
+
+
+def stream_suggest_features(
+    schema: dict, stats: dict, use_case: str,
+    base_url: str, api_key: str, model: str,
+):
+    prompt = (
+        f"## Use Case\n{use_case}\n\n"
+        f"## Schema\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
+        f"## Statistical Summaries\n```json\n{json.dumps(stats, indent=2)}\n```"
+    )
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": FEATURE_SUGGESTION_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        stream=True,
+    )
+    for chunk in stream:
+        if chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def _parse_pg_conn_string(conn_str: str) -> dict:
+    parts = {}
+    for token in conn_str.split():
+        if "=" in token:
+            k, v = token.split("=", 1)
+            parts[k] = v
+    return {
+        "host": parts.get("host", "localhost"),
+        "port": parts.get("port", "5432"),
+        "database": parts.get("dbname", "postgres"),
+        "user": parts.get("user", "postgres"),
+        "password": parts.get("password", ""),
+    }
+
+
+def generate_feature_repo(
+    features: list[dict], connections: list[dict], repo_dir: str,
+) -> list[str]:
+    os.makedirs(os.path.join(repo_dir, "data"), exist_ok=True)
+    created = []
+
+    pg_conn = next(
+        (c for c in connections if c["type"] == "PostgreSQL" and c["conn"].strip()),
+        None,
+    )
+    pg_params = _parse_pg_conn_string(pg_conn["conn"]) if pg_conn else {
+        "host": "localhost", "port": "5432", "database": "postgres",
+        "user": "postgres", "password": "postgres",
+    }
+
+    yaml_content = textwrap.dedent(f"""\
+        project: feature_repo
+        provider: local
+        registry:
+          type: file
+          path: data/registry.db
+        online_store:
+          type: sqlite
+          path: data/online_store.db
+        offline_store:
+          type: postgres
+          host: {pg_params['host']}
+          port: {pg_params['port']}
+          database: {pg_params['database']}
+          db_schema: public
+          user: {pg_params['user']}
+          password: {pg_params['password']}
+        entity_key_serialization_version: 2
+    """)
+    yaml_path = os.path.join(repo_dir, "feature_store.yaml")
+    with open(yaml_path, "w") as f:
+        f.write(yaml_content)
+    created.append("feature_store.yaml")
+
+    entities = {}
+    views_by_table = {}
+    for feat in features:
+        entity = feat["entity"]
+        if entity not in entities:
+            entities[entity] = feat.get("source_table", "unknown")
+        table = feat["source_table"]
+        views_by_table.setdefault(table, []).append(feat)
+
+    lines = [
+        "from datetime import timedelta",
+        "",
+        "from feast import Entity, FeatureService, FeatureView, Field",
+        "from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import (",
+        "    PostgreSQLSource,",
+        ")",
+        "from feast.types import Float64, Int64, String, Bool, UnixTimestamp",
+        "",
+    ]
+
+    for ent_name in entities:
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", ent_name)
+        lines.append(f'{safe} = Entity(name="{ent_name}", join_keys=["{ent_name}"])')
+    lines.append("")
+
+    view_names = []
+    for table, feats in views_by_table.items():
+        source_var = f"{table}_source"
+        lines.append(f'{source_var} = PostgreSQLSource(')
+        lines.append(f'    name="{table}_source",')
+        lines.append(f'    query="SELECT * FROM {table}",')
+        lines.append(f'    timestamp_field="created_at",')
+        lines.append(f")")
+        lines.append("")
+
+        view_name = f"{table}_features"
+        view_names.append(view_name)
+        entity_name = feats[0]["entity"]
+        safe_entity = re.sub(r"[^a-zA-Z0-9_]", "_", entity_name)
+
+        field_lines = []
+        for feat in feats:
+            dtype = FEAST_DTYPE_MAP.get(feat.get("dtype", "FLOAT64"), "Float64")
+            field_lines.append(f'        Field(name="{feat["name"]}", dtype={dtype}),')
+
+        lines.append(f"{view_name} = FeatureView(")
+        lines.append(f'    name="{view_name}",')
+        lines.append(f"    entities=[{safe_entity}],")
+        lines.append(f"    ttl=timedelta(days=1),")
+        lines.append(f"    schema=[")
+        lines.extend(field_lines)
+        lines.append(f"    ],")
+        lines.append(f"    source={source_var},")
+        lines.append(f")")
+        lines.append("")
+
+    lines.append("feature_service = FeatureService(")
+    lines.append('    name="feature_service",')
+    lines.append(f"    features=[{', '.join(view_names)}],")
+    lines.append(")")
+    lines.append("")
+
+    features_path = os.path.join(repo_dir, "features.py")
+    with open(features_path, "w") as f:
+        f.write("\n".join(lines))
+    created.append("features.py")
+
+    return created
+
+
+def run_feast_apply(repo_dir: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["feast", "-c", repo_dir, "apply"],
+        capture_output=True, text=True, timeout=120,
+    )
+    output = result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr
+    return result.returncode == 0, output
+
+
+def generate_sdk_snippets(repo_dir: str, features: list[dict]) -> str:
+    feature_refs = []
+    views_seen = set()
+    for feat in features:
+        view_name = f"{feat['source_table']}_features"
+        if view_name not in views_seen:
+            views_seen.add(view_name)
+        feature_refs.append(f'    "{view_name}:{feat["name"]}",')
+
+    refs_str = "\n".join(feature_refs)
+    entity_name = features[0]["entity"] if features else "entity_id"
+
+    return textwrap.dedent(f"""\
+        from feast import FeatureStore
+        import pandas as pd
+
+        # Initialize the feature store
+        store = FeatureStore(repo_path="{repo_dir}")
+
+        # --- Get Historical Features (for training) ---
+        entity_df = pd.DataFrame({{
+            "{entity_name}": [1, 2, 3],
+            "event_timestamp": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+        }})
+
+        feature_refs = [
+        {refs_str}
+        ]
+
+        training_df = store.get_historical_features(
+            entity_df=entity_df,
+            features=feature_refs,
+        ).to_df()
+        print(training_df.head())
+
+        # --- Get Online Features (for inference) ---
+        online_features = store.get_online_features(
+            features=feature_refs,
+            entity_rows=[{{"{entity_name}": 1}}, {{"{entity_name}": 2}}],
+        ).to_dict()
+        print(online_features)
+
+        # --- Materialize (push offline features to online store) ---
+        from datetime import datetime, timedelta
+
+        store.materialize(
+            start_date=datetime.now() - timedelta(days=7),
+            end_date=datetime.now(),
+        )
+    """)
+
+
 # --- Streamlit UI ---
 
 st.set_page_config(page_title="Schema Discovery + EDA", layout="wide")
@@ -307,8 +573,9 @@ if st.button("Discover Schemas & Run EDA", type="primary"):
 
 # Display results if available
 if "results_schema" in st.session_state:
-    tab_schema, tab_stats, tab_prompt, tab_eda = st.tabs([
-        "Schema", "Statistics (Native SQL)", "LLM Prompt", "LLM EDA Analysis"
+    tab_schema, tab_stats, tab_prompt, tab_eda, tab_feat = st.tabs([
+        "Schema", "Statistics (Native SQL)", "LLM Prompt", "LLM EDA Analysis",
+        "Feature Engineering",
     ])
 
     with tab_schema:
@@ -347,3 +614,178 @@ if "results_schema" in st.session_state:
             st.markdown(st.session_state.results_eda)
         else:
             st.info("Click 'Discover Schemas & Run EDA' to start.")
+
+    with tab_feat:
+        st.subheader("Feature Engineering")
+        use_case = st.text_input(
+            "Use Case",
+            placeholder="e.g., fraud detection, customer churn prediction, credit risk scoring",
+            key="feature_use_case_input",
+        )
+
+        if st.button("Suggest Features", type="primary", disabled=not use_case.strip()):
+            try:
+                table_placeholder = st.empty()
+                raw_expander = st.expander("Show raw LLM output", expanded=False)
+                raw_text_placeholder = raw_expander.empty()
+
+                full_text = ""
+                parsed_features = []
+                brace_depth = 0
+                in_string = False
+                escape_next = False
+                obj_start = -1
+
+                col_order = ["name", "description", "entity", "source_table",
+                             "columns", "transformation", "dtype"]
+
+                for token in stream_suggest_features(
+                    st.session_state.results_schema,
+                    st.session_state.results_stats,
+                    use_case,
+                    llm_url, llm_key, llm_model,
+                ):
+                    full_text += token
+                    raw_text_placeholder.code(full_text, language="json")
+
+                    for ch in token:
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if ch == "\\" and in_string:
+                            escape_next = True
+                            continue
+                        if ch == '"':
+                            in_string = not in_string
+                            continue
+                        if in_string:
+                            continue
+                        if ch == "{":
+                            if brace_depth == 0:
+                                obj_start = full_text.rfind("{")
+                            brace_depth += 1
+                        elif ch == "}":
+                            brace_depth -= 1
+                            if brace_depth == 0 and obj_start != -1:
+                                obj_text = full_text[obj_start:full_text.rfind("}") + 1]
+                                try:
+                                    feat = json.loads(obj_text)
+                                    if isinstance(feat.get("columns"), list):
+                                        feat["columns"] = ", ".join(feat["columns"])
+                                    parsed_features.append(feat)
+                                    df = pd.DataFrame(parsed_features)
+                                    display_cols = [c for c in col_order if c in df.columns]
+                                    table_placeholder.dataframe(
+                                        df[display_cols],
+                                        hide_index=True,
+                                        use_container_width=True,
+                                    )
+                                except (json.JSONDecodeError, KeyError):
+                                    pass
+                                obj_start = -1
+
+                for feat in parsed_features:
+                    feat["selected"] = True
+                st.session_state.suggested_features = parsed_features
+                st.session_state.feature_repo_generated = False
+                st.session_state.feast_applied = False
+            except Exception as e:
+                st.error(f"Feature suggestion failed: {e}")
+
+        if "suggested_features" in st.session_state:
+            st.divider()
+            st.markdown("**Review suggested features** — uncheck any you want to exclude:")
+
+            display_df = pd.DataFrame(st.session_state.suggested_features)
+            col_order = ["selected", "name", "description", "entity", "source_table",
+                         "columns", "transformation", "dtype"]
+            col_order = [c for c in col_order if c in display_df.columns]
+            display_df = display_df[col_order]
+
+            edited = st.data_editor(
+                display_df,
+                column_config={
+                    "selected": st.column_config.CheckboxColumn("Select", default=True),
+                    "name": st.column_config.TextColumn("Feature Name", disabled=True),
+                    "description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+                    "entity": st.column_config.TextColumn("Entity", disabled=True),
+                    "source_table": st.column_config.TextColumn("Source Table", disabled=True),
+                    "columns": st.column_config.TextColumn("Source Columns", disabled=True),
+                    "transformation": st.column_config.TextColumn("Transformation", disabled=True, width="large"),
+                    "dtype": st.column_config.TextColumn("Type", disabled=True),
+                },
+                hide_index=True,
+                use_container_width=True,
+                key="feature_editor",
+            )
+
+            selected = edited[edited["selected"] == True]
+            total = len(edited)
+            st.caption(f"{len(selected)} of {total} features selected")
+
+            st.divider()
+
+            repo_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_repo")
+
+            if st.button(
+                "Generate Feature Repo",
+                type="primary",
+                disabled=len(selected) == 0,
+            ):
+                sel_features = selected.drop(columns=["selected"]).to_dict("records")
+                for feat in sel_features:
+                    if isinstance(feat.get("columns"), str):
+                        feat["columns"] = [c.strip() for c in feat["columns"].split(",")]
+                with st.spinner("Generating feature repo..."):
+                    try:
+                        created = generate_feature_repo(
+                            sel_features,
+                            st.session_state.connections,
+                            repo_dir,
+                        )
+                        st.session_state.feature_repo_generated = True
+                        st.session_state.selected_features = sel_features
+                        st.success(f"Feature repo created at `{repo_dir}/`")
+                        st.markdown("**Generated files:**")
+                        for f in created:
+                            st.markdown(f"- `{f}`")
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
+
+            if st.session_state.get("feature_repo_generated"):
+                with st.expander("View generated feature_store.yaml"):
+                    yaml_path = os.path.join(repo_dir, "feature_store.yaml")
+                    if os.path.exists(yaml_path):
+                        with open(yaml_path) as f:
+                            st.code(f.read(), language="yaml")
+
+                with st.expander("View generated features.py"):
+                    py_path = os.path.join(repo_dir, "features.py")
+                    if os.path.exists(py_path):
+                        with open(py_path) as f:
+                            st.code(f.read(), language="python")
+
+                st.divider()
+
+                if st.button("Run Feast Apply", type="primary"):
+                    with st.spinner("Running `feast apply`..."):
+                        try:
+                            success, output = run_feast_apply(repo_dir)
+                            st.session_state.feast_applied = success
+                            if success:
+                                st.success("Feast apply completed successfully!")
+                            else:
+                                st.error("Feast apply failed.")
+                            with st.expander("Command output", expanded=not success):
+                                st.code(output, language="text")
+                        except Exception as e:
+                            st.error(f"Feast apply error: {e}")
+
+                if st.session_state.get("feast_applied"):
+                    st.divider()
+                    st.subheader("SDK Code Snippets")
+                    st.markdown("Use the following code to interact with your feature store:")
+                    snippets = generate_sdk_snippets(
+                        repo_dir, st.session_state.selected_features,
+                    )
+                    st.code(snippets, language="python")
