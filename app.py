@@ -335,7 +335,8 @@ def generate_feature_repo(
           db_schema: public
           user: {pg_params['user']}
           password: {pg_params['password']}
-        entity_key_serialization_version: 2
+        sslmode: disable
+        entity_key_serialization_version: 3
     """)
     yaml_path = os.path.join(repo_dir, "feature_store.yaml")
     with open(yaml_path, "w") as f:
@@ -354,7 +355,7 @@ def generate_feature_repo(
     lines = [
         "from datetime import timedelta",
         "",
-        "from feast import Entity, FeatureService, FeatureView, Field",
+        "from feast import Entity, FeatureService, FeatureView, Field, ValueType",
         "from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import (",
         "    PostgreSQLSource,",
         ")",
@@ -364,7 +365,7 @@ def generate_feature_repo(
 
     for ent_name in entities:
         safe = re.sub(r"[^a-zA-Z0-9_]", "_", ent_name)
-        lines.append(f'{safe} = Entity(name="{ent_name}", join_keys=["{ent_name}"])')
+        lines.append(f'{safe} = Entity(name="{ent_name}", join_keys=["{ent_name}"], value_type=ValueType.INT64)')
     lines.append("")
 
     view_names = []
