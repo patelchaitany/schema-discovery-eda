@@ -5,6 +5,8 @@ description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = [
     "feast[postgres]>=0.64.0",
+    "grpcio-health-checking>=1.81.1",
+    "grpcio-reflection>=1.81.1",
     "openai>=2.44.0",
     "pandas>=2.3.3",
     "psycopg2-binary>=2.9.12",

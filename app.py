@@ -238,7 +238,7 @@ def schema_to_tables(schema: dict) -> dict[str, pd.DataFrame]:
         for table_dict in table_list:
             for table_name, columns in table_dict.items():
                 rows = [{"Column": col, "Data Type": dtype} for col, dtype in columns.items()]
-                tables[f"{db_name}.{table_name}"] = pd.DataFrame(rows)
+                tables[f"{db_name}_{table_name}"] = pd.DataFrame(rows)
     return tables
 
 
@@ -251,6 +251,263 @@ FEAST_DTYPE_MAP = {
     "BOOL": "Bool",
     "UNIX_TIMESTAMP": "UnixTimestamp",
 }
+
+FEAST_SKILL = {
+    "name": "feast-user-guide",
+    "description": (
+        "Guide for working with Feast (Feature Store) — defining features, "
+        "configuring feature_store.yaml, retrieving features online/offline, "
+        "using the CLI, and building RAG retrieval pipelines."
+    ),
+    "content": textwrap.dedent("""\
+        # Feast User Guide
+
+        ## Quick Start
+
+        A Feast project requires:
+        1. A `feature_store.yaml` config file
+        2. Python files defining entities, data sources, feature views, and feature services
+        3. Running `feast apply` to register definitions
+
+        ```bash
+        feast init my_project
+        cd my_project
+        feast apply
+        ```
+
+        ## Core Concepts
+
+        ### Entity
+        An entity is a collection of semantically related features (e.g., a customer, a driver).
+        Entities have join keys used to look up features.
+
+        ```python
+        from feast import Entity
+        from feast.value_type import ValueType
+
+        driver = Entity(
+            name="driver_id",
+            description="Driver identifier",
+            value_type=ValueType.INT64,
+        )
+        ```
+
+        ### Data Sources
+        Data sources describe where raw feature data lives.
+
+        ```python
+        from feast import FileSource, BigQuerySource, KafkaSource, PushSource, RequestSource
+        from feast.data_format import ParquetFormat
+
+        driver_stats_source = FileSource(
+            name="driver_stats_source",
+            path="data/driver_stats.parquet",
+            timestamp_field="event_timestamp",
+            created_timestamp_column="created",
+        )
+
+        input_request = RequestSource(
+            name="vals_to_add",
+            schema=[Field(name="val_to_add", dtype=Float64)],
+        )
+        ```
+
+        ### FeatureView
+        Maps features from a data source to entities with a schema, TTL, and online/offline settings.
+
+        ```python
+        from feast import FeatureView, Field
+        from feast.types import Float32, Int64, String
+        from datetime import timedelta
+
+        driver_hourly_stats = FeatureView(
+            name="driver_hourly_stats",
+            entities=[driver],
+            ttl=timedelta(days=365),
+            schema=[
+                Field(name="conv_rate", dtype=Float32),
+                Field(name="acc_rate", dtype=Float32),
+                Field(name="avg_daily_trips", dtype=Int64),
+            ],
+            online=True,
+            source=driver_stats_source,
+        )
+        ```
+
+        ### OnDemandFeatureView
+        Computes features at request time from other feature views and/or request data.
+
+        ```python
+        from feast import on_demand_feature_view
+        import pandas as pd
+
+        @on_demand_feature_view(
+            sources=[driver_hourly_stats, input_request],
+            schema=[Field(name="conv_rate_plus_val", dtype=Float64)],
+            mode="pandas",
+        )
+        def transformed_conv_rate(inputs: pd.DataFrame) -> pd.DataFrame:
+            df = pd.DataFrame()
+            df["conv_rate_plus_val"] = inputs["conv_rate"] + inputs["val_to_add"]
+            return df
+        ```
+
+        ### FeatureService
+        Groups features from multiple views for retrieval.
+
+        ```python
+        from feast import FeatureService
+
+        driver_fs = FeatureService(
+            name="driver_ranking",
+            features=[driver_hourly_stats, transformed_conv_rate],
+        )
+        ```
+
+        ## Feature Retrieval
+
+        ### Online (low-latency)
+        ```python
+        from feast import FeatureStore
+
+        store = FeatureStore(repo_path=".")
+
+        features = store.get_online_features(
+            features=[
+                "driver_hourly_stats:conv_rate",
+                "driver_hourly_stats:acc_rate",
+            ],
+            entity_rows=[{"driver_id": 1001}, {"driver_id": 1002}],
+        ).to_dict()
+        ```
+
+        ### Historical (training data with point-in-time joins)
+        ```python
+        entity_df = pd.DataFrame({
+            "driver_id": [1001, 1002],
+            "event_timestamp": [datetime(2023, 1, 1), datetime(2023, 1, 2)],
+        })
+
+        training_df = store.get_historical_features(
+            entity_df=entity_df,
+            features=["driver_hourly_stats:conv_rate", "driver_hourly_stats:acc_rate"],
+        ).to_df()
+        ```
+
+        Or use a FeatureService:
+        ```python
+        training_df = store.get_historical_features(
+            entity_df=entity_df,
+            features=driver_fs,
+        ).to_df()
+        ```
+
+        ## Materialization
+
+        Load features from offline store into online store:
+
+        ```bash
+        feast materialize 2023-01-01T00:00:00 2023-12-31T23:59:59
+        feast materialize-incremental $(date -u +"%Y-%m-%dT%H:%M:%S")
+        ```
+
+        Python API:
+        ```python
+        from datetime import datetime
+        store.materialize(start_date=datetime(2023, 1, 1), end_date=datetime(2023, 12, 31))
+        store.materialize_incremental(end_date=datetime.utcnow())
+        ```
+
+        ## CLI Commands
+
+        | Command | Purpose |
+        |---------|---------|
+        | `feast init [DIR]` | Create new feature repository |
+        | `feast apply` | Register/update feature definitions |
+        | `feast plan` | Preview changes without applying |
+        | `feast materialize START END` | Materialize features to online store |
+        | `feast materialize-incremental END` | Incremental materialization |
+        | `feast entities list` | List registered entities |
+        | `feast feature-views list` | List feature views |
+        | `feast feature-services list` | List feature services |
+        | `feast teardown` | Remove infrastructure resources |
+        | `feast version` | Show SDK version |
+
+        ## Vector Search / RAG
+
+        ```python
+        from feast.types import Array, Float32
+
+        wiki_passages = FeatureView(
+            name="wiki_passages",
+            entities=[passage_entity],
+            schema=[
+                Field(name="passage_text", dtype=String),
+                Field(
+                    name="embedding",
+                    dtype=Array(Float32),
+                    vector_index=True,
+                    vector_length=384,
+                    vector_search_metric="COSINE",
+                ),
+            ],
+            source=passages_source,
+            online=True,
+        )
+
+        results = store.retrieve_online_documents(
+            feature="wiki_passages:embedding",
+            query=query_embedding,
+            top_k=5,
+        )
+        ```
+
+        ## feature_store.yaml Minimal Config
+
+        ```yaml
+        project: my_project
+        registry: data/registry.db
+        provider: local
+        online_store:
+          type: sqlite
+          path: data/online_store.db
+        ```
+
+        ## Common Imports
+
+        ```python
+        from feast import (
+            Entity, FeatureView, OnDemandFeatureView, FeatureService,
+            Field, FileSource, RequestSource, FeatureStore,
+        )
+        from feast.on_demand_feature_view import on_demand_feature_view
+        from feast.types import Float32, Float64, Int64, String, Bool, Array
+        from feast.value_type import ValueType
+        from datetime import timedelta
+        ```
+    """),
+}
+
+
+def parse_skill_frontmatter(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            front = parts[1].strip()
+            body = parts[2].strip()
+            name = ""
+            description = ""
+            for line in front.splitlines():
+                line = line.strip()
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip()
+            return {"name": name or "unnamed_skill", "description": description, "content": body}
+    title_match = re.search(r"^#\s+(.+)", text, re.MULTILINE)
+    name = title_match.group(1).strip() if title_match else "unnamed_skill"
+    return {"name": name, "description": "", "content": text}
 
 
 def parse_feature_json(text: str) -> list[dict]:
@@ -268,11 +525,24 @@ def parse_feature_json(text: str) -> list[dict]:
 def stream_suggest_features(
     schema: dict, stats: dict, use_case: str,
     base_url: str, api_key: str, model: str,
+    skills: list[dict] | None = None,
 ):
+    skills_section = ""
+    if skills:
+        parts = []
+        for s in skills:
+            parts.append(f"### Skill: {s['name']}\n{s.get('description', '')}\n\n{s['content']}")
+        skills_section = (
+            "\n\n## Reference Skills\n"
+            "Use these reference guides to inform your feature suggestions. "
+            "Follow the patterns, naming conventions, and best practices described below.\n\n"
+            + "\n\n---\n\n".join(parts)
+        )
     prompt = (
         f"## Use Case\n{use_case}\n\n"
         f"## Schema\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
         f"## Statistical Summaries\n```json\n{json.dumps(stats, indent=2)}\n```"
+        f"{skills_section}"
     )
     client = OpenAI(base_url=base_url, api_key=api_key)
     stream = client.chat.completions.create(
@@ -481,14 +751,64 @@ def generate_sdk_snippets(repo_dir: str, features: list[dict]) -> str:
 st.set_page_config(page_title="Schema Discovery + EDA", layout="wide")
 st.title("Schema Discovery + LLM EDA")
 
-# Sidebar: LLM config
+# Sidebar: LLM config + Skills
 with st.sidebar:
     st.header("LLM Configuration")
     llm_url = st.text_input("LLM Base URL", value="http://localhost:11434/v1")
     llm_key = st.text_input("API Key", value="ollama")
-    llm_model = st.text_input("Model", value="llama3.1:8b")
-    st.header("System Prompt")
-    system_prompt = st.text_area("Edit the system prompt", value=SYSTEM_PROMPT, height=300)
+    llm_model = st.text_input("Model", value="nemotron-3-ultra:cloud")
+
+    sidebar_prompt_tab, sidebar_skills_tab = st.tabs(["System Prompt", "Skills"])
+
+    with sidebar_prompt_tab:
+        system_prompt = st.text_area("Edit the system prompt", value=SYSTEM_PROMPT, height=300)
+
+    with sidebar_skills_tab:
+        st.caption("Upload or paste skill guides (markdown with optional frontmatter).")
+
+        if "skills" not in st.session_state:
+            st.session_state.skills = [dict(FEAST_SKILL)]
+
+        uploaded = st.file_uploader(
+            "Upload skill (.md)", type=["md", "txt"], key="skill_uploader",
+        )
+        if uploaded is not None:
+            raw = uploaded.read().decode("utf-8")
+            parsed = parse_skill_frontmatter(raw)
+            if not any(s["name"] == parsed["name"] for s in st.session_state.skills):
+                st.session_state.skills.append(parsed)
+                st.rerun()
+
+        for idx, skill in enumerate(st.session_state.skills):
+            with st.expander(skill["name"], expanded=False):
+                st.markdown(f"**{skill.get('description', '')}**")
+                st.session_state.skills[idx]["name"] = st.text_input(
+                    "Name", value=skill["name"], key=f"skill_name_{idx}",
+                )
+                st.session_state.skills[idx]["description"] = st.text_area(
+                    "Description", value=skill.get("description", ""),
+                    key=f"skill_desc_{idx}", height=68,
+                )
+                st.session_state.skills[idx]["content"] = st.text_area(
+                    "Content", value=skill["content"],
+                    key=f"skill_content_{idx}", height=300,
+                )
+                if st.button("Remove", key=f"skill_rm_{idx}"):
+                    st.session_state.skills.pop(idx)
+                    st.rerun()
+
+        with st.expander("Paste a new skill", expanded=False):
+            pasted = st.text_area(
+                "Paste skill markdown (with or without frontmatter)",
+                key="skill_paste_input", height=200,
+            )
+            if st.button("Add Skill", key="skill_paste_btn") and pasted.strip():
+                parsed = parse_skill_frontmatter(pasted)
+                if not any(s["name"] == parsed["name"] for s in st.session_state.skills):
+                    st.session_state.skills.append(parsed)
+                    st.rerun()
+                else:
+                    st.warning(f"Skill '{parsed['name']}' already exists.")
 
 # Connection strings
 st.header("Data Sources")
@@ -645,6 +965,7 @@ if "results_schema" in st.session_state:
                     st.session_state.results_stats,
                     use_case,
                     llm_url, llm_key, llm_model,
+                    skills=st.session_state.get("skills", []),
                 ):
                     full_text += token
                     raw_text_placeholder.code(full_text, language="json")

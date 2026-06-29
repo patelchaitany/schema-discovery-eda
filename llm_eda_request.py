@@ -4,7 +4,7 @@ from openai import OpenAI
 
 OGX_BASE_URL = "http://localhost:11434/v1"
 OGX_API_KEY = "ollama"
-MODEL = "llama3.1:8b"
+MODEL = "nemotron-3-ultra:cloud"
 
 SYSTEM_PROMPT = """You are a senior data analyst. Given a database schema in JSON format, perform a Basic Exploratory Data Analysis (EDA). Your analysis should cover:
 
