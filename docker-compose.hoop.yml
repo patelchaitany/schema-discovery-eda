@@ -1,0 +1,61 @@
+name: schema-discovery-hoop
+
+services:
+  hoop-db:
+    image: postgres:17
+    networks:
+      - hoopnet
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hoopdb
+      PGUSER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 30s
+      retries: 10
+      start_period: 20s
+
+  gateway:
+    image: hoophq/hoop
+    tty: true
+    environment:
+      - GIN_MODE=release
+      - POSTGRES_DB_URI=postgres://postgres:postgres@hoop-db:5432/hoopdb?sslmode=disable
+      - AUTH_METHOD=local
+      - JWT_SECRET_KEY=00ba8f316aedd9109823ebb8773e68e5edb2af8d7f755ad298646d53ab57f9ef
+      - ADMIN_USERNAME=admin
+    command: ["hoop", "start", "gateway"]
+    ports:
+      - "8009:8009"
+      - "8010:8010"
+    networks:
+      - hoopnet
+    depends_on:
+      hoop-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8009/api/healthz || exit 1"]
+      interval: 2s
+      timeout: 30s
+      retries: 10
+      start_period: 20s
+
+  agent:
+    image: hoophq/hoopdev
+    networks:
+      - hoopnet
+    environment:
+      - POSTGRES_DB_URI=postgres://postgres:postgres@hoop-db:5432/hoopdb?sslmode=disable
+      - DEFAULT_AGENT_GRPC_SCHEME=grpc
+      - DEFAULT_AGENT_GRPC_HOST=gateway:8010
+      - DEFAULT_AGENT_GATEWAY_URL=ws://gateway:8009
+    depends_on:
+      gateway:
+        condition: service_healthy
+    command: hoop-default-agent.sh
+
+networks:
+  hoopnet:
+    driver: bridge
