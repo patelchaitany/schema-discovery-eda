@@ -4,8 +4,6 @@ import re
 import subprocess
 import sys
 import textwrap
-import urllib.request
-import urllib.error
 
 import streamlit as st
 import psycopg2
@@ -1112,33 +1110,6 @@ def generate_sdk_snippets(repo_dir: str, features: list[dict], view_map: dict[st
     """)
 
 
-# --- Hoop Gateway Client ---
-
-def hoop_execute(
-    gateway_url: str, api_key: str, connection: str, script: str,
-) -> tuple[bool, str]:
-    url = f"{gateway_url.rstrip('/')}/api/sessions"
-    payload = json.dumps({"connection": connection, "script": script, "type": "exec"}).encode()
-    req = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get("exit_code", 1) == 0:
-                return True, data.get("output", "OK")
-            return False, data.get("output", "Unknown error")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode() if e.fp else ""
-        return False, f"HTTP {e.code}: {body}"
-    except Exception as e:
-        return False, str(e)
-
-
 # --- Transformation Generation ---
 
 def _get_pg_context(pg_conn_str: str) -> str:
@@ -1220,6 +1191,23 @@ def _get_pg_context(pg_conn_str: str) -> str:
         return ""
 
 
+TRANSFORMATION_MONGO_PROMPT = """You are a MongoDB expert. Convert the given transformation description into a valid MongoDB aggregation pipeline.
+
+You will receive collection schemas, sample documents, and index info. Use ONLY the fields and collections shown — do NOT invent fields.
+
+RULES:
+- Output ONLY a valid JSON object with this structure:
+  {"source_collection": "<collection_name>", "pipeline": [...stages...]}
+- The pipeline MUST end with a $out stage writing to "computed_<feature_name>"
+- The output documents MUST have exactly 3 fields: the entity field (e.g. customer_id), the computed value named as the feature_name, and "created_at" set to the current date via {"$literal": new Date()} or "$$NOW"
+- Use $group, $project, $addFields, $lookup, $unwind, $match as needed
+- For counts use $sum: 1, for averages use $avg, etc.
+- Use $ifNull to provide sensible defaults (0 for counts/sums, 0.0 for ratios)
+- Check the date ranges: if data ends before today, do NOT use date filters relative to now
+- For dependent features that reference other computed_* collections, use $lookup
+- Return ONLY raw JSON. No explanation, no markdown fences, no comments."""
+
+
 TRANSFORMATION_SQL_PROMPT = """You are a PostgreSQL expert. Convert the given transformation description into valid executable SQL.
 
 You will receive the EXACT database DDL, foreign keys, date ranges, and sample rows. Use ONLY the columns and tables shown — do NOT invent columns.
@@ -1289,7 +1277,6 @@ def generate_and_execute_sql(
     pg_context: str = "", prior_sqls: list[dict] | None = None,
     max_retries: int = 3,
     on_attempt: callable = None,
-    hoop_config: dict | None = None,
 ) -> tuple[bool, str, str | None]:
     """Generate SQL via LLM, execute it, retry on failure with error context.
     Returns (success, sql_or_error, last_error_if_failed)."""
@@ -1306,15 +1293,7 @@ def generate_and_execute_sql(
     for attempt in range(max_retries):
         if on_attempt:
             on_attempt(attempt, sql)
-        if hoop_config:
-            ok, err = hoop_execute(
-                hoop_config["gateway_url"],
-                hoop_config["api_key"],
-                hoop_config["connection"],
-                sql,
-            )
-        else:
-            ok, err = pg_execute_direct(pg_conn_str, sql)
+        ok, err = pg_execute_direct(pg_conn_str, sql)
         if ok:
             return True, sql, None
         if attempt == max_retries - 1:
@@ -1344,6 +1323,119 @@ def pg_execute_direct(conn_str: str, sql: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _get_mongo_context(uri: str, db_name: str) -> str:
+    try:
+        client = MongoClient(uri)
+        db = client[db_name]
+        sections = []
+        for col_name in sorted(db.list_collection_names()):
+            col = db[col_name]
+            docs = list(col.find().limit(3))
+            field_types = {}
+            for doc in docs:
+                for k, v in doc.items():
+                    if k not in field_types:
+                        field_types[k] = BSON_TYPE_MAP.get(type(v), type(v).__name__)
+            schema_str = ", ".join(f"{k}: {v}" for k, v in field_types.items())
+            section = f"Collection: {col_name}\n  Fields: {schema_str}\n  Count: {col.estimated_document_count()}"
+            indexes = col.index_information()
+            if indexes:
+                idx_str = ", ".join(f"{n}: {list(v['key'])}" for n, v in indexes.items() if n != "_id_")
+                if idx_str:
+                    section += f"\n  Indexes: {idx_str}"
+            sample_lines = []
+            for doc in docs[:2]:
+                clean = {k: str(v) for k, v in doc.items()}
+                sample_lines.append(f"    {clean}")
+            if sample_lines:
+                section += "\n  Samples:\n" + "\n".join(sample_lines)
+            sections.append(section)
+        client.close()
+        return "\n\n".join(sections)
+    except Exception:
+        return ""
+
+
+def _strip_json_fences(text: str) -> str:
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def mongo_execute_direct(uri: str, db_name: str, pipeline_json: str) -> tuple[bool, str]:
+    try:
+        data = json.loads(pipeline_json)
+        source = data["source_collection"]
+        pipeline = data["pipeline"]
+        client = MongoClient(uri)
+        db = client[db_name]
+        list(db[source].aggregate(pipeline))
+        client.close()
+        return True, "OK"
+    except json.JSONDecodeError as e:
+        return False, f"Invalid JSON: {e}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _build_mongo_prompt(
+    feature: dict, mongo_context: str, prior_pipelines: list[dict] | None,
+) -> str:
+    prior_context = ""
+    if prior_pipelines:
+        parts = [f"-- Feature: {p['name']}\n{p['pipeline']}" for p in prior_pipelines]
+        prior_context = (
+            "\n\n## Previously generated computed collections\n"
+            "These collections already exist. Use $lookup to reference them.\n\n"
+            + "\n\n".join(parts)
+        )
+    return (
+        f"Feature name: {feature['name']}\n"
+        f"Entity field: {feature['entity']}\n"
+        f"Source collection: {feature['source_table']}\n"
+        f"Transformation: {feature['transformation']}\n\n"
+        f"## MongoDB Schema\n{mongo_context}"
+        f"{prior_context}\n\n"
+        "Convert this into a valid MongoDB aggregation pipeline JSON."
+    )
+
+
+def generate_and_execute_mongo(
+    feature: dict, mongo_uri: str, mongo_db: str,
+    base_url: str, api_key: str, model: str,
+    mongo_context: str = "", prior_pipelines: list[dict] | None = None,
+    max_retries: int = 3,
+    on_attempt: callable = None,
+) -> tuple[bool, str, str | None]:
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    prompt = _build_mongo_prompt(feature, mongo_context, prior_pipelines)
+
+    messages = [
+        {"role": "system", "content": TRANSFORMATION_MONGO_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    resp = client.chat.completions.create(model=model, messages=messages)
+    pipeline_json = _strip_json_fences(resp.choices[0].message.content)
+
+    for attempt in range(max_retries):
+        if on_attempt:
+            on_attempt(attempt, pipeline_json)
+        ok, err = mongo_execute_direct(mongo_uri, mongo_db, pipeline_json)
+        if ok:
+            return True, pipeline_json, None
+        if attempt == max_retries - 1:
+            return False, pipeline_json, err
+        messages.append({"role": "assistant", "content": pipeline_json})
+        messages.append({"role": "user", "content": (
+            f"This pipeline failed with error:\n{err}\n\n"
+            f"Fix the pipeline and return ONLY the corrected JSON. No explanation."
+        )})
+        resp = client.chat.completions.create(model=model, messages=messages)
+        pipeline_json = _strip_json_fences(resp.choices[0].message.content)
+
+    return False, pipeline_json, err
+
+
 # --- Streamlit UI ---
 
 st.set_page_config(page_title="Schema Discovery + EDA", layout="wide")
@@ -1361,18 +1453,6 @@ with st.sidebar:
         "Model for SQL/Mongo conversion", value="llama3.1:8b",
         help="Cheap local model that converts the transformation field into valid executable SQL or MongoDB pipelines.",
     )
-
-    st.header("Hoop Gateway")
-    hoop_enabled = st.toggle("Route writes through Hoop", value=False,
-        help="When enabled, CREATE TABLE transformations execute via Hoop gateway instead of direct PostgreSQL.")
-    if hoop_enabled:
-        hoop_url = st.text_input("Gateway URL", value="http://localhost:8009")
-        hoop_api_key = st.text_input("Hoop API Key", value="", type="password")
-        hoop_pg_conn = st.text_input("PG Connection Name", value="pg-banking")
-    else:
-        hoop_url = ""
-        hoop_api_key = ""
-        hoop_pg_conn = ""
 
     sidebar_prompt_tab, sidebar_skills_tab = st.tabs(["System Prompt", "Skills"])
 
@@ -1426,50 +1506,24 @@ with st.sidebar:
                 else:
                     st.warning(f"Skill '{parsed['name']}' already exists.")
 
-# Connection strings
-st.header("Data Sources")
-PG_DEFAULT = "host=localhost port=5432 dbname=banking_db user=postgres password=postgres"
-MONGO_DEFAULT = "mongodb://localhost:27017"
-MONGO_DB_DEFAULT = "banking_mongo"
+# Connection
+st.header("Data Source")
 
 if "connections" not in st.session_state:
-    st.session_state.connections = [
-        {"type": "PostgreSQL", "conn": PG_DEFAULT, "db": ""},
-        {"type": "MongoDB", "conn": MONGO_DEFAULT, "db": MONGO_DB_DEFAULT},
-    ]
+    st.session_state.connections = [{"type": "PostgreSQL", "conn": "", "db": ""}]
 
-def add_connection():
-    st.session_state.connections.append({"type": "PostgreSQL", "conn": "", "db": ""})
-
-def remove_connection(idx):
-    st.session_state.connections.pop(idx)
-
-for i, conn in enumerate(st.session_state.connections):
-    col1, col2, col3, col4 = st.columns([1, 3, 2, 0.5])
-    with col1:
-        st.session_state.connections[i]["type"] = st.selectbox(
-            "Type", ["PostgreSQL", "MongoDB"], key=f"type_{i}",
-            index=0 if conn["type"] == "PostgreSQL" else 1
-        )
-    with col2:
-        st.session_state.connections[i]["conn"] = st.text_input(
-            "Connection String", value=conn["conn"], key=f"conn_{i}",
-            placeholder="host=localhost port=5432 dbname=banking_db user=postgres password=postgres"
-            if conn["type"] == "PostgreSQL" else "mongodb://localhost:27017"
-        )
-    with col3:
-        if st.session_state.connections[i]["type"] == "MongoDB":
-            st.session_state.connections[i]["db"] = st.text_input(
-                "Database Name", value=conn["db"], key=f"db_{i}",
-                placeholder="banking_mongo"
-            )
-        else:
-            st.empty()
-    with col4:
-        if len(st.session_state.connections) > 1:
-            st.button("X", key=f"rm_{i}", on_click=remove_connection, args=(i,))
-
-st.button("+ Add Connection", on_click=add_connection)
+conn = st.session_state.connections[0]
+conn["type"] = st.selectbox("Database Type", ["PostgreSQL", "MongoDB"])
+PG_DEFAULT = "host=localhost port=5432 dbname=banking_db user=postgres password=postgres"
+MONGO_DEFAULT = "mongodb://localhost:27017"
+default_conn = PG_DEFAULT if conn["type"] == "PostgreSQL" else MONGO_DEFAULT
+if not conn["conn"]:
+    conn["conn"] = default_conn
+conn["conn"] = st.text_input("Connection String", value=conn["conn"])
+if conn["type"] == "MongoDB":
+    if not conn["db"]:
+        conn["db"] = "banking_mongo"
+    conn["db"] = st.text_input("Database Name", value=conn["db"])
 
 # Run
 if st.button("Discover Schemas & Run EDA", type="primary"):
@@ -1735,31 +1789,12 @@ if "results_schema" in st.session_state:
 
                 source_types = st.session_state.get("table_source_types", {})
 
-                # Filter out MongoDB-sourced features (and dependents) from the pipeline
-                mongo_features = {f["name"] for f in sel_features
-                                  if source_types.get(f["source_table"]) == "mongodb"}
-                if mongo_features:
-                    # Cascade: also exclude features that depend on a MongoDB feature
-                    graph = build_dependency_graph(sel_features)
-                    for mf in list(mongo_features):
-                        mongo_features.update(get_all_descendants(graph, mf))
-                    excluded = [f for f in sel_features if f["name"] in mongo_features]
-                    sel_features = [f for f in sel_features if f["name"] not in mongo_features]
-                    # Strip dropped mongo deps from remaining features' depends_on lists
-                    for feat in sel_features:
-                        feat["depends_on"] = [d for d in feat.get("depends_on", [])
-                                              if d not in mongo_features]
-
                 def _log(msg, level="info"):
                     icon = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌"}.get(level, "")
                     log_container.markdown(f"`{datetime.utcnow().strftime('%H:%M:%S')}` {icon} {msg}")
 
-                if mongo_features:
-                    _log(f"Excluded **{len(mongo_features)}** MongoDB-sourced features from pipeline: {', '.join(f'`{n}`' for n in sorted(mongo_features))}", "warn")
-                    _log(f"**{len(sel_features)}** PostgreSQL features remain.")
-
                 # ── Step 1: Sort by dependency order ──
-                progress.info("Step 1/6 — Sorting features by dependency order...")
+                progress.info("Step 1/5 — Sorting features by dependency order...")
                 sorted_features = topological_sort_features(sel_features)
                 _log(f"Sorted **{len(sorted_features)}** features in dependency order.")
                 for i, f in enumerate(sorted_features):
@@ -1775,62 +1810,114 @@ if "results_schema" in st.session_state:
                      if c["type"] == "PostgreSQL" and c["conn"].strip()),
                     None,
                 )
-                if creation_features and pg_conn_str:
+                mongo_conn_cfg = next(
+                    (c for c in st.session_state.connections
+                     if c["type"] == "MongoDB" and c["conn"].strip()),
+                    None,
+                )
+
+                if creation_features:
+                    pg_creation = [f for f in creation_features if source_types.get(f["source_table"], "postgresql") == "postgresql"]
+                    mongo_creation = [f for f in creation_features if source_types.get(f["source_table"]) == "mongodb"]
                     progress.info(f"Step 2/5 — Building & executing {len(creation_features)} transformations...")
                     _log(f"**Building & executing** {len(creation_features)} computed features (with retry on error)...")
 
-                    pg_context = ""
-                    pg_conn_cfg = next(
-                        (c for c in st.session_state.connections
-                         if c["type"] == "PostgreSQL" and c["conn"].strip()),
-                        None,
-                    )
-                    if pg_conn_cfg:
-                        _log("Fetching DB context (DDL, foreign keys, date ranges, sample rows)...")
-                        pg_context = _get_pg_context(pg_conn_cfg["conn"])
-                        _log(f"DB context: {len(pg_context)} chars.", "ok")
-
                     results = {}
-                    prior_sqls = []
-                    for feat in creation_features:
-                        _log(f"  `{feat['name']}` — `{feat.get('transformation', 'N/A')[:80]}`")
 
-                        def _on_attempt(attempt, sql, _name=feat["name"]):
-                            if attempt == 0:
-                                log_container.code(sql, language="sql")
-                            else:
-                                _log(f"    Retry {attempt}/3 for `{_name}`...", "warn")
-                                log_container.code(sql, language="sql")
+                    # PostgreSQL transformations
+                    if pg_creation and pg_conn_str:
+                        pg_context = ""
+                        pg_conn_cfg = next(
+                            (c for c in st.session_state.connections
+                             if c["type"] == "PostgreSQL" and c["conn"].strip()),
+                            None,
+                        )
+                        if pg_conn_cfg:
+                            _log("Fetching PostgreSQL context...")
+                            pg_context = _get_pg_context(pg_conn_cfg["conn"])
+                            _log(f"PG context: {len(pg_context)} chars.", "ok")
 
-                        try:
-                            ok, sql, err = generate_and_execute_sql(
-                                feat, pg_conn_str,
-                                llm_url, llm_key, transform_model,
-                                pg_context=pg_context,
-                                prior_sqls=prior_sqls,
-                                on_attempt=_on_attempt,
-                                hoop_config=(
-                                    {"gateway_url": hoop_url, "api_key": hoop_api_key, "connection": hoop_pg_conn}
-                                    if hoop_enabled else None
-                                ),
-                            )
-                            st.session_state.transformation_commands[feat["name"]] = {"type": "sql", "command": sql}
-                            if ok:
-                                prior_sqls.append({"name": feat["name"], "sql": sql})
-                                results[feat["name"]] = (True, "OK")
-                                _log(f"    Executed successfully.", "ok")
-                            else:
-                                results[feat["name"]] = (False, err)
-                                _log(f"    Failed after 3 attempts: {err[:200]}", "err")
-                        except Exception as e:
-                            results[feat["name"]] = (False, str(e))
-                            _log(f"    Error: {e}", "err")
+                        prior_sqls = []
+                        for feat in pg_creation:
+                            _log(f"  `{feat['name']}` (SQL) — `{feat.get('transformation', 'N/A')[:80]}`")
+
+                            def _on_pg_attempt(attempt, sql, _name=feat["name"]):
+                                if attempt == 0:
+                                    log_container.code(sql, language="sql")
+                                else:
+                                    _log(f"    Retry {attempt}/3 for `{_name}`...", "warn")
+                                    log_container.code(sql, language="sql")
+
+                            try:
+                                ok, sql, err = generate_and_execute_sql(
+                                    feat, pg_conn_str,
+                                    llm_url, llm_key, transform_model,
+                                    pg_context=pg_context,
+                                    prior_sqls=prior_sqls,
+                                    on_attempt=_on_pg_attempt,
+                                )
+                                st.session_state.transformation_commands[feat["name"]] = {"type": "sql", "command": sql}
+                                if ok:
+                                    prior_sqls.append({"name": feat["name"], "sql": sql})
+                                    results[feat["name"]] = (True, "OK")
+                                    _log(f"    Executed successfully.", "ok")
+                                else:
+                                    results[feat["name"]] = (False, err)
+                                    _log(f"    Failed after 3 attempts: {err[:200]}", "err")
+                            except Exception as e:
+                                results[feat["name"]] = (False, str(e))
+                                _log(f"    Error: {e}", "err")
+                    elif pg_creation:
+                        _log("No PostgreSQL connection — cannot execute SQL transformations.", "err")
+                        for feat in pg_creation:
+                            results[feat["name"]] = (False, "No PostgreSQL connection")
+
+                    # MongoDB transformations
+                    if mongo_creation and mongo_conn_cfg:
+                        mongo_uri = mongo_conn_cfg["conn"]
+                        mongo_db_name = mongo_conn_cfg.get("db", "")
+                        _log("Fetching MongoDB context...")
+                        mongo_context = _get_mongo_context(mongo_uri, mongo_db_name)
+                        _log(f"Mongo context: {len(mongo_context)} chars.", "ok")
+
+                        prior_pipelines = []
+                        for feat in mongo_creation:
+                            _log(f"  `{feat['name']}` (MongoDB) — `{feat.get('transformation', 'N/A')[:80]}`")
+
+                            def _on_mongo_attempt(attempt, pipeline, _name=feat["name"]):
+                                if attempt == 0:
+                                    log_container.code(pipeline, language="json")
+                                else:
+                                    _log(f"    Retry {attempt}/3 for `{_name}`...", "warn")
+                                    log_container.code(pipeline, language="json")
+
+                            try:
+                                ok, pipeline_json, err = generate_and_execute_mongo(
+                                    feat, mongo_uri, mongo_db_name,
+                                    llm_url, llm_key, transform_model,
+                                    mongo_context=mongo_context,
+                                    prior_pipelines=prior_pipelines,
+                                    on_attempt=_on_mongo_attempt,
+                                )
+                                st.session_state.transformation_commands[feat["name"]] = {"type": "mongo", "command": pipeline_json}
+                                if ok:
+                                    prior_pipelines.append({"name": feat["name"], "pipeline": pipeline_json})
+                                    results[feat["name"]] = (True, "OK")
+                                    _log(f"    Executed successfully.", "ok")
+                                else:
+                                    results[feat["name"]] = (False, err)
+                                    _log(f"    Failed after 3 attempts: {err[:200]}", "err")
+                            except Exception as e:
+                                results[feat["name"]] = (False, str(e))
+                                _log(f"    Error: {e}", "err")
+                    elif mongo_creation:
+                        _log("No MongoDB connection — cannot execute MongoDB transformations.", "err")
+                        for feat in mongo_creation:
+                            results[feat["name"]] = (False, "No MongoDB connection")
 
                     st.session_state.transformation_results = results
                     ok_count = sum(1 for v in results.values() if v[0])
                     _log(f"Transformations: **{ok_count}/{len(results)}** succeeded.", "ok" if ok_count == len(results) else "warn")
-                elif creation_features:
-                    _log("No PostgreSQL connection — cannot execute transformations.", "err")
                 else:
                     _log("No features require creation — skipping transformations.")
 
@@ -1925,7 +2012,7 @@ if "results_schema" in st.session_state:
                         result = st.session_state.get("transformation_results", {}).get(feat_name)
                         status = "OK" if result and result[0] else "FAILED" if result else "PENDING"
                         st.markdown(f"**{feat_name}** — {status}")
-                        st.code(cmd["command"], language="sql")
+                        st.code(cmd["command"], language="json" if cmd.get("type") == "mongo" else "sql")
                         if result and not result[0]:
                             st.error(result[1])
 
