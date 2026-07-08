@@ -39,11 +39,11 @@ FEATURE_SUGGESTION_PROMPT = """You are a senior ML engineer. You will receive a 
 Suggest features that would be useful for the given use-case. For each feature, provide:
 - name: snake_case feature name
 - description: what this feature captures and why it matters for the use-case
-- entity: the primary key / entity column (e.g. "customer_id")
+- entity: the primary key / entity column that ACTUALLY EXISTS in the source table (check the DDL/schema carefully — use the real column name, e.g. "id" not "customer_id" if the table has "id")
 - source_table: which table the feature is derived from
-- columns: list of source columns used
+- columns: list of source columns used (MUST exist in the source table — check the DDL/schema)
 - transformation: SQL-like description of how to compute it
-- dtype: the Feast value type (one of: INT64, FLOAT64, STRING, BOOL, UNIX_TIMESTAMP)
+- dtype: the Feast value type (one of: INT64, FLOAT64, STRING, BOOL, UNIX_TIMESTAMP). Use INT64 for integer flags (0/1), not BOOL. Only use BOOL for actual boolean columns.
 - depends_on: list of feature names (from this same list) that must be computed before this feature. Empty list if no dependencies.
 - requires_creation: true if this feature does NOT already exist as a raw column and must be computed, false if it maps directly to an existing column
 
@@ -635,6 +635,7 @@ def stream_suggest_features(
     schema: dict, stats: dict, use_case: str,
     base_url: str, api_key: str, model: str,
     skills: list[dict] | None = None,
+    db_context: str = "",
 ):
     skills_section = ""
     if skills:
@@ -647,10 +648,18 @@ def stream_suggest_features(
             "Follow the patterns, naming conventions, and best practices described below.\n\n"
             + "\n\n---\n\n".join(parts)
         )
+    db_context_section = ""
+    if db_context:
+        db_context_section = (
+            f"\n\n## Database DDL / Structure\n"
+            f"Use this to verify exact column names, primary keys, foreign keys, and data types.\n"
+            f"```\n{db_context}\n```"
+        )
     prompt = (
         f"## Use Case\n{use_case}\n\n"
         f"## Schema\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
         f"## Statistical Summaries\n```json\n{json.dumps(stats, indent=2)}\n```"
+        f"{db_context_section}"
         f"{skills_section}"
     )
     client = OpenAI(base_url=base_url, api_key=api_key)
@@ -692,6 +701,28 @@ def _detect_timestamp_cols_for_tables(pg_conn_str: str, tables: list[str]) -> di
     cur.close()
     conn.close()
     return result
+
+
+def _find_entity_column(pg_conn_str: str, table_name: str, entity_col: str) -> str | None:
+    """Check if entity_col exists in the table. If not, look for 'id' as an alias candidate."""
+    try:
+        conn = psycopg2.connect(pg_conn_str)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position
+        """, (table_name,))
+        cols = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+        if entity_col in cols:
+            return entity_col
+        if "id" in cols:
+            return "id"
+        return None
+    except Exception:
+        return None
 
 
 def _introspect_table_columns(pg_conn_str: str, table_name: str, entity_col: str) -> list[str]:
@@ -805,6 +836,11 @@ def generate_feature_repo(
             ts_field = ts_cols.get(table, "created_at")
             entity_col = raw_feats[0]["entity"]
 
+            # Check if entity column needs aliasing in the source table
+            real_entity_col = None
+            if pg_conn_str:
+                real_entity_col = _find_entity_column(pg_conn_str, table, entity_col)
+
             # Introspect actual columns from DB for computed tables
             if table.startswith("computed_") and pg_conn_str:
                 actual_cols = _introspect_table_columns(pg_conn_str, table, entity_col)
@@ -813,9 +849,12 @@ def generate_feature_repo(
                 actual_col = None
 
             if actual_col and len(raw_feats) == 1 and raw_feats[0]["name"] != actual_col:
-                # Alias the real column to match the feature name
                 feat_name = raw_feats[0]["name"]
                 query = f'SELECT "{entity_col}", "{actual_col}" AS "{feat_name}", "created_at" FROM {table}'
+            elif real_entity_col and real_entity_col != entity_col:
+                other_cols = _introspect_table_columns(pg_conn_str, table, real_entity_col)
+                cols = [f'"{real_entity_col}" AS "{entity_col}"'] + [f'"{c}"' for c in other_cols]
+                query = f"SELECT {', '.join(cols)} FROM {table}"
             else:
                 query = f"SELECT * FROM {table}"
 
@@ -1639,12 +1678,21 @@ if "results_schema" in st.session_state:
                              "columns", "transformation", "dtype",
                              "depends_on", "requires_creation"]
 
+                _conn_cfg = st.session_state.connections[0] if st.session_state.connections else {}
+                if _conn_cfg.get("type") == "PostgreSQL" and _conn_cfg.get("conn", "").strip():
+                    _db_ctx = _get_pg_context(_conn_cfg["conn"])
+                elif _conn_cfg.get("type") == "MongoDB" and _conn_cfg.get("conn", "").strip():
+                    _db_ctx = _get_mongo_context(_conn_cfg["conn"], _conn_cfg.get("db", ""))
+                else:
+                    _db_ctx = ""
+
                 for token in stream_suggest_features(
                     st.session_state.results_schema,
                     st.session_state.results_stats,
                     use_case,
                     llm_url, llm_key, llm_model,
                     skills=st.session_state.get("skills", []),
+                    db_context=_db_ctx,
                 ):
                     full_text += token
                     raw_text_placeholder.code(full_text, language="json")
